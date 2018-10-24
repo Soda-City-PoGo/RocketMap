@@ -16,7 +16,7 @@ module.exports = function (grunt) {
                 files: {
                     'static/dist/css/app.built.css': 'static/sass/main.scss',
                     'static/dist/css/mobile.built.css': 'static/sass/mobile.scss',
-                    'static/dist/css/statistics.built.css': 'static/css/statistics.css',
+                    'static/dist/css/statistics.built.css': 'static/sass/statistics.scss',
                     'static/dist/css/status.built.css': 'static/sass/status.scss'
                 }
             }
@@ -76,11 +76,12 @@ module.exports = function (grunt) {
         minjson: {
             build: {
                 files: {
-                    'static/dist/data/pokemon.min.json': 'static/data/pokemon.json',
-                    'static/dist/data/moves.min.json': 'static/data/moves.json',
+                    'static/dist/data/pokemon.min.json': 'static/data/pokedex/pokemon.json',
+                    'static/dist/data/moves.min.json': 'static/data/pokedex/moves.json',
                     'static/dist/data/mapstyle.min.json': 'static/data/mapstyle.json',
                     'static/dist/data/searchmarkerstyle.min.json': 'static/data/searchmarkerstyle.json',
                     'static/dist/locales/de.min.json': 'static/locales/de.json',
+                    'static/dist/locales/es.min.json': 'static/locales/es.json',
                     'static/dist/locales/fr.min.json': 'static/locales/fr.json',
                     'static/dist/locales/ja.min.json': 'static/locales/ja.json',
                     'static/dist/locales/ko.min.json': 'static/locales/ko.json',

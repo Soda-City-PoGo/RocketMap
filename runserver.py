@@ -7,7 +7,6 @@ import logging
 import time
 import re
 import ssl
-import json
 import requests
 
 from distutils.version import StrictVersion
@@ -19,15 +18,17 @@ from flask_cache_bust import init_cache_busting
 
 from pogom.app import Pogom
 from pogom.utils import (get_args, now, gmaps_reverse_geolocate,
-                         log_resource_usage_loop)
+                         log_resource_usage_loop, get_debug_dump_link,
+                         dynamic_loading_refresher, dynamic_rarity_refresher)
 from pogom.altitude import get_gmaps_altitude
 
 from pogom.models import (init_database, create_tables, drop_tables,
-                          PlayerLocale, SpawnPoint, db_updater, clean_db_loop,
+                          PlayerLocale, db_updater, clean_db_loop,
                           verify_table_encoding, verify_database_schema)
 from pogom.webhook import wh_updater
 
-from pogom.proxy import load_proxies, check_proxies, proxies_refresher
+from pogom.osm import update_ex_gyms
+from pogom.proxy import initialize_proxies
 from pogom.search import search_overseer_thread
 from time import strftime
 
@@ -90,7 +91,7 @@ def install_thread_excepthook():
             run_old(*args, **kwargs)
         except (KeyboardInterrupt, SystemExit):
             raise
-        except:
+        except Exception:
             exc_type, exc_value, exc_trace = sys.exc_info()
 
             # Handle Flask's broken pipe when a client prematurely ends
@@ -183,9 +184,22 @@ def can_start_scanning(args):
         log.critical('Hash key is required for scanning. Exiting.')
         return False
 
-    # Check the PoGo api pgoapi implements against what RM is expecting
+    # Check the PoGo api pgoapi implements against what RM is expecting.
+    # Some API versions have a non-standard version int, so we map them
+    # to the correct one.
+    api_version_int = int(args.api_version.replace('.', '0'))
+    api_version_map = {
+        8302: 8300,
+        8501: 8500,
+        8705: 8700,
+        8901: 8900,
+        9101: 9100,
+        9102: 9100
+    }
+    mapped_version_int = api_version_map.get(api_version_int, api_version_int)
+
     try:
-        if PGoApi.get_api_version() != int(args.api_version.replace('.', '0')):
+        if PGoApi.get_api_version() != mapped_version_int:
             log.critical(api_version_error)
             return False
     except AttributeError:
@@ -193,6 +207,43 @@ def can_start_scanning(args):
         return False
 
     return True
+
+
+def startup_db(app, clear_db):
+    db = init_database(app)
+    if clear_db:
+        log.info('Clearing database')
+        drop_tables(db)
+
+    verify_database_schema(db)
+
+    create_tables(db)
+
+    # Fix encoding on present and future tables.
+    verify_table_encoding(db)
+
+    if clear_db:
+        log.info(
+            'Drop and recreate is complete. Now remove -cd and restart.')
+        sys.exit()
+    return db
+
+
+def extract_coordinates(location):
+    # Use lat/lng directly if matches such a pattern.
+    prog = re.compile("^(\-?\d+\.\d+),?\s?(\-?\d+\.\d+)$")
+    res = prog.match(location)
+    if res:
+        log.debug('Using coordinates from CLI directly')
+        position = (float(res.group(1)), float(res.group(2)), 0)
+    else:
+        log.debug('Looking up coordinates in API')
+        position = util.get_pos_by_name(location)
+
+    if position is None or not any(position):
+        log.error("Location not found: '{}'".format(location))
+        sys.exit()
+    return position
 
 
 def main():
@@ -204,8 +255,9 @@ def main():
 
     args = get_args()
 
-    # Abort if only-server and no-server are used together
+    set_log_and_verbosity(log)
 
+    # Abort if only-server and no-server are used together.
     if args.only_server and args.no_server:
         log.critical(
             "You can't use no-server and only-server at the same time, silly.")
@@ -217,31 +269,33 @@ def main():
         log.critical('Status name contains illegal characters.')
         sys.exit(1)
 
-    set_log_and_verbosity(log)
+    # Stop if we're just looking for a debug dump.
+    if args.dump:
+        log.info('Retrieving environment info...')
+        hastebin_id = get_debug_dump_link()
+        log.info('Done! Your debug link: https://hastebin.com/%s.txt',
+                 hastebin_id)
+        sys.exit(1)
 
     # Let's not forget to run Grunt / Only needed when running with webserver.
     if not args.no_server and not validate_assets(args):
         sys.exit(1)
 
-    # Use lat/lng directly if matches such a pattern.
-    prog = re.compile("^(\-?\d+\.\d+),?\s?(\-?\d+\.\d+)$")
-    res = prog.match(args.location)
-    if res:
-        log.debug('Using coordinates from CLI directly')
-        position = (float(res.group(1)), float(res.group(2)), 0)
-    else:
-        log.debug('Looking up coordinates in API')
-        position = util.get_pos_by_name(args.location)
+    # Make sure they are warned.
+    if args.no_version_check and not args.only_server:
+        log.warning('You are running RocketMap in No Version Check mode. '
+                    "If you don't know what you're doing, this mode "
+                    'can have negative consequences, and you will not '
+                    'receive support running in NoVC mode. '
+                    'You have been warned.')
 
-    if position is None or not any(position):
-        log.error("Location not found: '{}'".format(args.location))
-        sys.exit()
+    position = extract_coordinates(args.location)
 
     # Use the latitude and longitude to get the local altitude from Google.
     (altitude, status) = get_gmaps_altitude(position[0], position[1],
                                             args.gmaps_key)
     if altitude is not None:
-        log.debug('Local altitude is: %sm', altitude)
+        log.debug('Local altitude is: %sm.', altitude)
         position = (position[0], position[1], altitude)
     else:
         if status == 'REQUEST_DENIED':
@@ -254,17 +308,18 @@ def main():
             log.error('Unable to retrieve altitude from Google APIs' +
                       'setting to 0')
 
-    log.info('Parsed location is: %.4f/%.4f/%.4f (lat/lng/alt)',
+    log.info('Parsed location is: %.4f/%.4f/%.4f (lat/lng/alt).',
              position[0], position[1], position[2])
 
-    if args.no_pokemon:
-        log.info('Parsing of Pokemon disabled.')
-    if args.no_pokestops:
-        log.info('Parsing of Pokestops disabled.')
-    if args.no_gyms:
-        log.info('Parsing of Gyms disabled.')
-    if args.encounter:
-        log.info('Encountering pokemon enabled.')
+    # Scanning toggles.
+    log.info('Parsing of Pokemon %s.',
+             'disabled' if args.no_pokemon else 'enabled')
+    log.info('Parsing of Pokestops %s.',
+             'disabled' if args.no_pokestops else 'enabled')
+    log.info('Parsing of Gyms %s.',
+             'disabled' if args.no_gyms else 'enabled')
+    log.info('Pokemon encounters %s.',
+             'enabled' if args.encounter else 'disabled')
 
     app = None
     if not args.no_server and not args.clear_db:
@@ -274,27 +329,18 @@ def main():
         app.before_request(app.validate_request)
         app.set_current_location(position)
 
-    db = init_database(app)
-    if args.clear_db:
-        log.info('Clearing database')
-        if args.db_type == 'mysql':
-            drop_tables(db)
-        elif os.path.isfile(args.db):
-            os.remove(args.db)
-
-    verify_database_schema(db)
-
-    create_tables(db)
-
-    # Fix encoding on present and future tables.
-    verify_table_encoding(db)
-
-    if args.clear_db:
-        log.info(
-            'Drop and recreate is complete. Now remove -cd and restart.')
-        sys.exit()
+    db = startup_db(app, args.clear_db)
 
     args.root_path = os.path.dirname(os.path.abspath(__file__))
+
+    if args.ex_gyms:
+        # Geofence is required.
+        if not args.geofence_file:
+            log.critical('A geofence is required to find EX-gyms.')
+            sys.exit(1)
+        update_ex_gyms(args.geofence_file)
+        log.info('Finished checking gyms against OSM parks, exiting.')
+        sys.exit(1)
 
     # Control the search status (running or not) across threads.
     control_flags = {
@@ -327,7 +373,7 @@ def main():
         t.start()
 
     # Database cleaner; really only need one ever.
-    if args.enable_clean:
+    if args.db_cleanup:
         t = Thread(target=clean_db_loop, name='db-cleaner', args=(args,))
         t.daemon = True
         t.start()
@@ -339,7 +385,7 @@ def main():
     wh_updates_queue = Queue()
     wh_key_cache = {}
 
-    if len(args.wh_types) == 0:
+    if not args.wh_types:
         log.info('Webhook disabled.')
     else:
         log.info('Webhook enabled for events: sending %s to %s.',
@@ -355,27 +401,49 @@ def main():
             t.start()
 
     if not args.only_server:
+        # Speed limit.
+        log.info('Scanning speed limit %s.',
+                 'set to {} km/h'.format(args.kph)
+                 if args.kph > 0 else 'disabled')
+        log.info('High-level speed limit %s.',
+                 'set to {} km/h'.format(args.hlvl_kph)
+                 if args.hlvl_kph > 0 else 'disabled')
+
         # Check if we are able to scan.
         if not can_start_scanning(args):
             sys.exit(1)
 
-        # Processing proxies if set (load from file, check and overwrite old
-        # args.proxy with new working list).
-        args.proxy = load_proxies(args)
+        initialize_proxies(args)
 
-        if args.proxy and not args.proxy_skip_check:
-            args.proxy = check_proxies(args, args.proxy)
+        # Monitor files, update data if they've changed recently.
+        # Keys are 'args' object keys, values are filenames to load.
+        files_to_monitor = {}
 
-        # Run periodical proxy refresh thread.
-        if (args.proxy_file is not None) and (args.proxy_refresh > 0):
-            t = Thread(target=proxies_refresher,
-                       name='proxy-refresh', args=(args,))
+        if args.encounter:
+            files_to_monitor['enc_whitelist'] = args.enc_whitelist_file
+            log.info('Encounters are enabled.')
+        else:
+            log.info('Encounters are disabled.')
+
+        if args.webhook_blacklist_file:
+            files_to_monitor['webhook_blacklist'] = args.webhook_blacklist_file
+            log.info('Webhook blacklist is enabled.')
+        elif args.webhook_whitelist_file:
+            files_to_monitor['webhook_whitelist'] = args.webhook_whitelist_file
+            log.info('Webhook whitelist is enabled.')
+        else:
+            log.info('Webhook whitelist/blacklist is disabled.')
+
+        if files_to_monitor:
+            t = Thread(target=dynamic_loading_refresher,
+                       name='dynamic-enclist', args=(files_to_monitor,))
             t.daemon = True
             t.start()
+            log.info('Dynamic list refresher is enabled.')
         else:
-            log.info('Periodical proxies refresh disabled.')
+            log.info('Dynamic list refresher is disabled.')
 
-        # Update player locale if not set correctly, yet.
+        # Update player locale if not set correctly yet.
         args.player_locale = PlayerLocale.get_locale(args.location)
         if not args.player_locale:
             args.player_locale = gmaps_reverse_geolocate(
@@ -394,20 +462,6 @@ def main():
                 'Existing player locale has been retrieved from the DB.')
 
         # Gather the Pokemon!
-
-        # Attempt to dump the spawn points (do this before starting threads of
-        # endure the woe).
-        if (args.spawnpoint_scanning and
-                args.spawnpoint_scanning != 'nofile' and
-                args.dump_spawnpoints):
-            with open(args.spawnpoint_scanning, 'w+') as file:
-                log.info(
-                    'Saving spawn points to %s', args.spawnpoint_scanning)
-                spawns = SpawnPoint.get_spawnpoints_in_hex(
-                    position, args.step_limit)
-                file.write(json.dumps(spawns))
-                log.info('Finished exporting spawn points')
-
         argset = (args, new_location_queue, control_flags,
                   heartbeat, db_updates_queue, wh_updates_queue)
 
@@ -423,6 +477,15 @@ def main():
         while search_thread.is_alive():
             time.sleep(60)
     else:
+        # Dynamic rarity.
+        if args.rarity_update_frequency:
+            t = Thread(target=dynamic_rarity_refresher,
+                       name='dynamic-rarity')
+            t.daemon = True
+            t.start()
+            log.info('Dynamic rarity is enabled.')
+        else:
+            log.info('Dynamic rarity is disabled.')
 
         if args.cors:
             CORS(app)
@@ -456,9 +519,7 @@ def set_log_and_verbosity(log):
     if not os.path.exists(args.log_path):
         os.mkdir(args.log_path)
     if not args.no_file_logs:
-        date = strftime('%Y%m%d_%H%M')
-        filename = os.path.join(
-            args.log_path, '{}_{}.log'.format(date, args.status_name))
+        filename = os.path.join(args.log_path, args.log_filename)
         filelog = logging.FileHandler(filename)
         filelog.setFormatter(logging.Formatter(
             '%(asctime)s [%(threadName)18s][%(module)14s][%(levelname)8s] ' +

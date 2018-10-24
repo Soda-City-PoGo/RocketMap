@@ -6,6 +6,7 @@ import requests
 import sys
 import time
 
+from threading import Thread
 from random import randint
 from utils import get_async_requests_session
 
@@ -90,11 +91,11 @@ def get_proxy_test_status(proxy, future_ptc, future_niantic):
 # Requests to send for testing, which returns futures for Niantic and PTC.
 def start_request_futures(ptc_session, niantic_session, proxy, timeout):
     # URLs for proxy testing.
-    proxy_test_url = 'https://pgorelease.nianticlabs.com/plfe/rpc'
-    proxy_test_ptc_url = 'https://sso.pokemon.com/sso/oauth2.0/authorize?' \
-                         'client_id=mobile-app_pokemon-go&redirect_uri=' \
-                         'https%3A%2F%2Fwww.nianticlabs.com%2Fpokemongo' \
-                         '%2Ferror'
+    proxy_test_url = 'https://pgorelease.nianticlabs.com/plfe/version'
+    proxy_test_ptc_url = 'https://sso.pokemon.com/sso/login' \
+                         '?service=https%3A%2F%2Fsso.pokemon.com' \
+                         '%2Fsso%2Foauth2.0%2FcallbackAuthorize' \
+                         '&locale=en_US'
 
     log.debug('Checking proxy: %s.', proxy)
 
@@ -103,22 +104,28 @@ def start_request_futures(ptc_session, niantic_session, proxy, timeout):
         proxy_test_ptc_url,
         proxies={'http': proxy, 'https': proxy},
         timeout=timeout,
-        headers={'User-Agent': ('pokemongo/1 '
-                                'CFNetwork/811.4.18 '
-                                'Darwin/16.5.0'),
-                 'Host': 'sso.pokemon.com',
-                 'X-Unity-Version': '5.5.1f1',
-                 'Connection': 'close'},
+        headers={'Host': 'sso.pokemon.com',
+                 'Connection': 'close',
+                 'Accept': '*/*',
+                 'User-Agent': 'pokemongo/0 CFNetwork/893.14.2 Darwin/17.3.0',
+                 'Accept-Language': 'en-us',
+                 'Accept-Encoding': 'br, gzip, deflate',
+                 'X-Unity-Version': '2017.1.2f1'},
         background_callback=__proxy_check_completed,
         stream=True)
 
     # Send request to nianticlabs.com.
-    future_niantic = niantic_session.post(
+    future_niantic = niantic_session.get(
         proxy_test_url,
-        '',
         proxies={'http': proxy, 'https': proxy},
         timeout=timeout,
-        headers={'Connection': 'close'},
+        headers={'Host': 'pgorelease.nianticlabs.com',
+                 'Connection': 'close',
+                 'Accept': '*/*',
+                 'User-Agent': 'pokemongo/0 CFNetwork/893.14.2 Darwin/17.3.0',
+                 'Accept-Language': 'en-us',
+                 'Accept-Encoding': 'br, gzip, deflate',
+                 'X-Unity-Version': '2017.1.2f1'},
         background_callback=__proxy_check_completed,
         stream=True)
 
@@ -297,6 +304,24 @@ def get_new_proxy(args):
         lp = 0
 
     return lp, args.proxy[lp]
+
+
+def initialize_proxies(args):
+    # Processing proxies if set (load from file, check and overwrite old
+    # args.proxy with new working list).
+    args.proxy = load_proxies(args)
+
+    if args.proxy and not args.proxy_skip_check:
+        args.proxy = check_proxies(args, args.proxy)
+
+    # Run periodical proxy refresh thread.
+    if (args.proxy_file is not None) and (args.proxy_refresh > 0):
+        t = Thread(target=proxies_refresher,
+                   name='proxy-refresh', args=(args,))
+        t.daemon = True
+        t.start()
+    else:
+        log.info('Periodical proxies refresh disabled.')
 
 
 # Background handler for completed proxy check requests.

@@ -123,7 +123,7 @@ def check_login(args, account, api, proxy_url):
 # Simulate real app via login sequence.
 def rpc_login_sequence(args, api, account):
     total_req = 0
-    app_version = int(args.api_version.replace('.', '0'))
+    app_version = PGoApi.get_api_version()
 
     # 1 - Make an empty request to mimick real app behavior.
     log.debug('Starting RPC login sequence...')
@@ -172,10 +172,12 @@ def rpc_login_sequence(args, api, account):
 
     try:
         req = api.create_request()
-        req.download_remote_config_version(platform=1,
-                                           app_version=app_version)
-        send_generic_request(req, account, settings=True, buddy=False,
-                             inbox=False)
+        req.download_remote_config_version(
+            platform=1,
+            device_model=api.device_info['device_model_boot'],
+            app_version=app_version)
+        send_generic_request(
+            req, account, settings=True, buddy=False, inbox=False)
 
         total_req += 1
         time.sleep(random.uniform(.53, 1.1))
@@ -309,7 +311,21 @@ def rpc_login_sequence(args, api, account):
                       e)
         raise LoginSequenceFail('Failed during login sequence.')
 
-    # 8 - Check if there are level up rewards to claim.
+    log.debug('Fetching News...')
+    try:  # 8 - Make an empty request to fetch all News.
+        req = api.create_request()
+        req.fetch_all_news()
+        send_generic_request(req, account, settings=True)
+
+        total_req += 1
+        time.sleep(random.uniform(.45, .7))
+    except Exception as e:
+        log.exception('Login for account %s failed. Exception while ' +
+                      'fetching all news: %s.', account['username'],
+                      e)
+        raise LoginSequenceFail('Failed during login sequence.')
+
+    # 9 - Check if there are level up rewards to claim.
     log.debug('Checking if there are level up rewards to claim...')
 
     try:
@@ -496,10 +512,12 @@ def spin_pokestop(api, account, args, fort, step_location):
         time.sleep(random.uniform(2, 4))  # Don't let Niantic throttle.
 
         # Check for reCaptcha.
-        captcha_url = response['responses']['CHECK_CHALLENGE'].challenge_url
-        if len(captcha_url) > 1:
-            log.debug('Account encountered a reCaptcha.')
-            return False
+        if 'CHECK_CHALLENGE' in response['responses']:
+            captcha_url = response[
+                'responses']['CHECK_CHALLENGE'].challenge_url
+            if len(captcha_url) > 1:
+                log.debug('Account encountered a reCaptcha.')
+                return False
 
         spin_result = response['responses']['FORT_SEARCH'].result
         if spin_result == 1:
@@ -556,11 +574,12 @@ def clear_inventory(api, account):
         time.sleep(random.uniform(2, 4))
         release_p_response = release_pokemon(api, account, 0, release_ids)
 
-        captcha_url = release_p_response[
-            'responses']['CHECK_CHALLENGE'].challenge_url
-        if len(captcha_url) > 1:
-            log.info('Account encountered a reCaptcha.')
-            return False
+        if 'CHECK_CHALLENGE' in release_p_response['responses']:
+            captcha_url = release_p_response[
+                'responses']['CHECK_CHALLENGE'].challenge_url
+            if len(captcha_url) > 1:
+                log.info('Account encountered a reCaptcha.')
+                return False
 
         release_response = release_p_response['responses']['RELEASE_POKEMON']
         release_result = release_response.result
@@ -582,15 +601,17 @@ def clear_inventory(api, account):
             time.sleep(random.uniform(2, 4))
             resp = recycle_inventory_item(api, account, item_id, drop_count)
 
-            captcha_url = resp['responses']['CHECK_CHALLENGE'].challenge_url
-            if len(captcha_url) > 1:
-                log.info('Account encountered a reCaptcha.')
-                return False
+            if 'CHECK_CHALLENGE' in resp['responses']:
+                captcha_url = resp[
+                    'responses']['CHECK_CHALLENGE'].challenge_url
+                if len(captcha_url) > 1:
+                    log.info('Account encountered a reCaptcha.')
+                    return False
 
             clear_response = resp['responses']['RECYCLE_INVENTORY_ITEM']
             clear_result = clear_response.result
             if clear_result == 1:
-                log.info('Clearing %s %ss succeeded.', item_count,
+                log.info('Clearing %s %ss succeeded.', drop_count,
                          item_name)
             elif clear_result == 2:
                 log.debug('Not enough items to clear, parsing failed.')
@@ -699,11 +720,12 @@ class AccountSet(object):
                 # Check if we're below speed limit for account.
                 last_scanned = account.get('last_scanned', False)
 
-                if last_scanned:
+                if last_scanned and self.kph > 0:
                     seconds_passed = now - last_scanned
                     old_coords = account.get('last_coords', coords_to_scan)
 
                     distance_m = distance(old_coords, coords_to_scan)
+
                     cooldown_time_sec = distance_m / self.kph * 3.6
 
                     # Not enough time has passed for this one.

@@ -1,13 +1,12 @@
-# Using a MySQL Server
+# Installing MySQL
 
-**This is a guide for windows only currently.**
-**Preliminary Linux (Debian) instructions below (VII)**
+**This guide is primarily for Windows.**
+**However, preliminary Linux (Debian) instructions are below (VII)**
 **Preliminary Docker (modern Linux OS w/ Docker & git installed) instructions below (VIII)**
 
 ## I. Prerequisites
-1. Have already ran/operated the RocketMap using the default database setup.
-2. Have the "develop" build of RocketMap. [Available here.](https://rocketmap.readthedocs.io/en/develop/basic-install/index.html)
-3. Downloaded [MariaDB](https://downloads.mariadb.org/)
+1. Have the "develop" build of RocketMap. [Available here.](https://rocketmap.readthedocs.io/en/develop/basic-install/index.html)
+2. Downloaded [MariaDB](https://downloads.mariadb.org/)
 
 ## II. Installing MariaDB
 1. Run the install file, for me this was: mariadb-10.1.16-winx64.msi
@@ -35,7 +34,7 @@
    GRANT ALL PRIVILEGES ON rocketmapdb . * TO 'rocketmapuser'@'localhost';
    exit
    ```
-   You can change `rocketmapdb` to whatever you want the name of the database to be.
+   You can change `rocketmapdb` to whatever you want the name of the database to be. Also, be sure to change `'password'` to the password you want to use.
 5. If the database creation was successful it will tell you "Query OK, 1 row affected". If it doesn't echo that back at you then you either received an error message, or it just created a blank line. I've detailed how to fix common errors, and the blank line below.
    - **Blank line:**
      You simply missed the ";" in the CREATE DATABASE command. Essentially you didn't close of the line, so the program thinks you still have more information to input. Simply insert a ; onto the blank line and hit enter and it should echo "Query OK" at you.
@@ -44,6 +43,8 @@
    - **Error: "ERROR 1007 (HY000): Can't create database 'rocketmapdb'; database exists"**
      The rocketmapdb database already exists.
      If you're trying to start a fresh database you'll need to execute `DROP DATABASE rocketmapdb`, and then run `CREATE DATABASE rocketgomapdb`. If you want to keep the rocketmapdb but start a new one, change the name.
+   - **(1045, u"Access denied for user 'rocketmapuser'@'localhost' (using password: YES)")**
+     You might be using **password** as your password for the database user **rocketmapuser**. Simply run `ALTER USER 'rocketmapuser'@'localhost' IDENTIFIED BY 'password';` and replace `'password'` with the password you want to use.
 6. Congratulations, your database is now setup and ready to be used.
 
 ## IV. Setting up the Config.ini file
@@ -57,7 +58,6 @@
         - Change "username" to your respective username for the selected service.
         - Change "password" to your respective password for the username on the selected service.
     - **Database Settings:** This is the important section you will want to modify.
-        - Change the "db-type" to "mysql"
         - Change "db-host" to "127.0.0.1"
         - Change "db-name:" to "rocketmapdb"
         - Change "db-user:" to "rocketmapuser"
@@ -71,39 +71,24 @@
 5. Make sure you've removed all of the `#` from any line with a value you inputted. Indent the comments that are after the values as well, so they are on the following line below the variable they represent. For example:
    ```
    # Database settings
-   db-type: mysql
-   # sqlite (default) or mysql
+   db-name: mydb
+   # Required
    ```
 6. Go to File->Save as... and make sure you save this file into the same directory as the "config.ini.example", but obviously save it as "config.ini". Make sure it's saved as a .ini file type, and not anything else or it won't work.
 7. You're now done configuring your config.ini file.
 
-## V. Run it!
+MySQL is now installed, return to the main install guide. If you've encountered any errors it's most likely due to missing a parameter you commented out when you call runserver.py or you mis-typed something in your `config.ini`. However, if it's neither of those issues and something not covered in this guide hop into the RocketMap discord server, and go to the help channel. People there are great, and gladly assist people with troubleshooting issues.
 
-Now that we have our server setup and our config.ini filled out it's time to actually run the workers to make sure everything is in check. Remember from above if you commented out any parameters in the util.py file that all of those parameters need to be met and filled out when you run the runserver.py script. In our case we commented out location, and steps so we could individual choose where each worker scanned, and the size of the scan. I've put two code snippets below, one would be used if you didn't comment out anything and instead filled out the **[Search_Settings]** in section IV step 4 above. The other code snippet is what you would run if you commented out the same lines as I did in our running example.
-
-```
-python runserver.py
-```
-
-**Left Search_Settings at default**
-
-```
-python runserver.py -st 10 -l "[LOCATION]"
-```
-
-You should now be up and running. If you've encountered any errors it's most likely due to missing a parameter you commented out when you call runserver.py or you mis-typed something in your `config.ini`. However, if it's neither of those issues and something not covered in this guide hop into the RocketMap discord server, and go to the help channel. People there are great, and gladly assist people with troubleshooting issues.
-
-
-## Set up MySQL on a second computer, seperate from RM instances. 
+## Set up MySQL on a second computer, seperate from RM instances.
 
 In this example, computer running RocketMap will be `Server A` while computer running MySQL will be `Server B`.
 
-You will follow above directions for II and III on Server B and directions for IV on Server A. 
-***However:*** The following steps will be different. 
+You will follow above directions for II and III on Server B and directions for IV on Server A.
+***However:*** The following steps will be different.
 
 Server B- III
 
-You will need to grant your account permission to use the database outside of your database server. 
+You will need to grant your account permission to use the database outside of your database server.
 
 ```sql
    CREATE DATABASE rocketmapdb;
@@ -118,7 +103,6 @@ You need to tell RocketMap where the database is!
 
 ```
 **Database Settings:** This is the important section you will want to modify.
- - Change the "db-type" to "mysql"
  - Change "db-host" to [IP ADDDRESS OF SERVER B]
  - Change "db-name:" to "rocketmapdb"
  - Change "db-user:" to "rocketmapuser"
@@ -149,11 +133,10 @@ You need to tell RocketMap where the database is!
 
    ```
    # Database settings
-   db-type: mysql          # sqlite (default) or mysql
-   db-host: 127.0.0.1      # required for mysql
-   db-name: rocketmapdb # required for mysql
-   db-user: rocketmapuser    # required for mysql
-   db-pass: YourPW         # required for mysql
+   db-host: 127.0.0.1      
+   db-name: rocketmapdb # required
+   db-user: rocketmapuser    # required
+   db-pass: YourPW         # required
    ```
 
 ## Docker Settings w/ Let's Encrypt
@@ -170,7 +153,7 @@ _only pain comes from mysql5.7 and beyond_
 
 ```
 docker run --name mainmap -d --link pokesql pokemap --auth-service=ptc \
-  --username=youruser --password=yourpassword --db-type=mysql --db-host=pokesql \
+  --username=youruser --password=yourpassword --db-host=pokesql \
   --db-name=pokemap --db-user=root --db-pass=some-string --gmaps-key=someapikey
 ```
 
@@ -181,7 +164,7 @@ _OPTIONAL: always scan Austin, TX (SQL benchmark?)_
 ```
 docker run --name scanagent -d --link pokesql pokemap --no-server \
  --auth-service=ptc --location="Austin, TX" --username=yourotheruser \
- --password=yourotherpassword --db-type=mysql --db-host=pokemap \
+ --password=yourotherpassword --db-host=pokemap \
  --db-name=pokemap --db-user=root --db-pass=some-string \
  --gmaps-key=some-api-key
 ```

@@ -42,13 +42,14 @@ from cachetools import TTLCache
 
 from pgoapi.hash_server import HashServer
 from .models import (parse_map, GymDetails, parse_gyms, MainWorker,
-                     WorkerStatus, HashKeys)
+                     WorkerStatus, HashKeys, ScannedLocation)
 from .utils import now, distance
 from .transform import get_new_coords
 from .account import setup_api, check_login, AccountSet
 from .captcha import captcha_overseer_thread, handle_captcha
 from .proxy import get_new_proxy
 from .apiRequests import gym_get_info, get_map_objects as gmo
+from .transform import jitter_location
 
 log = logging.getLogger(__name__)
 
@@ -312,7 +313,14 @@ def worker_status_db_thread(threads_status, name, db_updates_queue):
                     'last_modified': datetime.utcnow(),
                     'accounts_working': status['active_accounts'],
                     'accounts_captcha': status['accounts_captcha'],
-                    'accounts_failed': status['accounts_failed']
+                    'accounts_failed': status['accounts_failed'],
+                    'success': status['success_total'],
+                    'fail': status['fail_total'],
+                    'empty': status['empty_total'],
+                    'skip': status['skip_total'],
+                    'captcha': status['captcha_total'],
+                    'start': status['starttime'],
+                    'elapsed': status['elapsed']
                 }
             elif status['type'] == 'Worker':
                 workers[status['username']] = WorkerStatus.db_format(
@@ -374,11 +382,13 @@ def search_overseer_thread(args, new_location_queue, control_flags, heartb,
         'accounts_captcha': 0,
         'accounts_failed': 0,
         'active_accounts': 0,
+        'busy_accounts': 0,
         'skip_total': 0,
         'captcha_total': 0,
         'success_total': 0,
         'fail_total': 0,
         'empty_total': 0,
+        'elapsed': 0,
         'scheduler': args.scheduler,
         'scheduler_status': {'tth_found': 0}
     }
@@ -621,6 +631,7 @@ def get_stats_message(threadStatus, search_items_queue_array, db_updates_queue,
     if elapsed == 0:
         elapsed = 1
 
+    overseer['elapsed'] = elapsed
     sph = overseer['success_total'] * 3600.0 / elapsed
     fph = overseer['fail_total'] * 3600.0 / elapsed
     eph = overseer['empty_total'] * 3600.0 / elapsed
@@ -645,13 +656,20 @@ def get_stats_message(threadStatus, search_items_queue_array, db_updates_queue,
              len(account_failures), len(account_captchas))
 
     message += (
-        'Total active: {}  |  Success: {} ({:.1f}/hr) | ' +
-        'Fails: {} ({:.1f}/hr) | Empties: {} ({:.1f}/hr) | ' +
-        'Skips {} ({:.1f}/hr) | Captchas: {} ({:.1f}/hr)|${:.5f}/hr|${:.3f}/mo'
-    ).format(overseer['active_accounts'], overseer['success_total'], sph,
+        'Total active: {}, busy: {}, idle: {} | ' +
+        'Success: {} ({:.1f}/hr) | ' +
+        'Fails: {} ({:.1f}/hr) | ' +
+        'Empties: {} ({:.1f}/hr) | ' +
+        'Skips {} ({:.1f}/hr) | ' +
+        'Captchas: {} ({:.2f}/hr)|${:.2f}/hr|${:.2f}/mo | ' +
+        'Elapsed: {:.1f}h'
+    ).format(overseer['active_accounts'], overseer['busy_accounts'],
+             (overseer['active_accounts'] - overseer['busy_accounts']),
+             overseer['success_total'], sph,
              overseer['fail_total'], fph, overseer['empty_total'], eph,
              overseer['skip_total'], skph, overseer['captcha_total'], cph,
-             ccost, cmonth)
+             ccost, cmonth, elapsed / 3600.0)
+
     return message
 
 
@@ -659,11 +677,17 @@ def update_total_stats(threadStatus, last_account_status):
     overseer = threadStatus['Overseer']
     # Calculate totals.
     active_count = 0
+    busy_count = 0
     current_accounts = Set()
     for tstatus in threadStatus.itervalues():
         if tstatus.get('type', '') == 'Worker':
-            if tstatus.get('active', False):
+
+            is_active = tstatus.get('active', False)
+            if is_active:
                 active_count += 1
+
+            if is_active and tstatus.get('message', '') != 'Nothing to scan.':
+                busy_count += 1
 
             username = tstatus.get('username', '')
             current_accounts.add(username)
@@ -685,6 +709,7 @@ def update_total_stats(threadStatus, last_account_status):
             }
 
     overseer['active_accounts'] = active_count
+    overseer['busy_accounts'] = busy_count
 
     # Remove last status for accounts that workers
     # are not using anymore
@@ -898,17 +923,28 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                         break
 
                 # Grab the next thing to search (when available).
-                step, step_location, appears, leaves, messages, wait = (
+                step, scan_coords, appears, leaves, messages, wait = (
                     scheduler.next_item(status))
+
                 status['message'] = messages['wait']
                 # The next_item will return the value telling us how long
-                # to sleep. This way the status can be updated
-                time.sleep(wait)
+                # to sleep. This way the status can be updated.
+                if wait > 0:
+                    time.sleep(wait)
 
                 # Using step as a flag for no valid next location returned.
                 if step == -1:
                     time.sleep(scheduler.delay(status['last_scan_date']))
                     continue
+
+                # get the ScannedLocation before jittering
+                scan_location = ScannedLocation.get_by_loc(scan_coords)
+
+                # Jitter the coords if configured.
+                if args.jitter:
+                    scan_coords = jitter_location(scan_coords)
+                    log.debug('Jittered to: %f/%f/%f.', scan_coords[0],
+                              scan_coords[1], scan_coords[2])
 
                 # Too soon?
                 # Adding a 10 second grace period.
@@ -944,7 +980,7 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                 # Let the api know where we intend to be for this loop.
                 # Doing this before check_login so it does not also have
                 # to be done when the auth token is refreshed.
-                api.set_position(*step_location)
+                api.set_position(*scan_coords)
 
                 if args.hash_key:
                     key = key_scheduler.next()
@@ -967,14 +1003,13 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
 
                 # Make the actual request.
                 scan_date = datetime.utcnow()
-                response_dict = gmo(
-                    api, account, step_location, args.no_jitter)
+                response_dict = gmo(api, account, scan_coords)
                 status['last_scan_date'] = datetime.utcnow()
 
                 # Record the time and the place that the worker made the
                 # request.
-                status['latitude'] = step_location[0]
-                status['longitude'] = step_location[1]
+                status['latitude'] = scan_coords[0]
+                status['longitude'] = scan_coords[1]
                 dbq.put((WorkerStatus, {0: WorkerStatus.db_format(status)}))
 
                 # Nothing back. Mark it up, sleep, carry on.
@@ -992,22 +1027,22 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                     captcha = handle_captcha(args, status, api, account,
                                              account_failures,
                                              account_captchas, whq,
-                                             response_dict, step_location)
+                                             response_dict, scan_coords)
                     if captcha is not None and captcha:
                         # Make another request for the same location
                         # since the previous one was captcha'd.
                         scan_date = datetime.utcnow()
-                        response_dict = gmo(
-                            api, account, step_location, args.no_jitter)
+                        response_dict = gmo(api, account, scan_coords)
                     elif captcha is not None:
                         account_queue.task_done()
                         time.sleep(3)
                         break
 
-                    parsed = parse_map(args, response_dict, step_location,
-                                       dbq, whq, key_scheduler, api, status,
-                                       scan_date, account, account_sets)
-                    del response_dict
+                    parsed = parse_map(args, response_dict, scan_coords,
+                                       scan_location, dbq, whq, key_scheduler,
+                                       api, status, scan_date, account,
+                                       account_sets)
+
                     scheduler.task_done(status, parsed)
                     if parsed['count'] > 0:
                         status['success'] += 1
@@ -1018,7 +1053,7 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                     consecutive_fails = 0
                     status['message'] = ('Search at {:6f},{:6f} completed ' +
                                          'with {} finds.').format(
-                        step_location[0], step_location[1],
+                        scan_coords[0], scan_coords[1],
                         parsed['count'])
                     log.debug(status['message'])
                 except Exception as e:
@@ -1029,11 +1064,12 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                     # counter in case of error.
                     status['message'] = ('Map parse failed at {:6f},{:6f}, ' +
                                          'abandoning location. {} may be ' +
-                                         'banned.').format(step_location[0],
-                                                           step_location[1],
+                                         'banned.').format(scan_coords[0],
+                                                           scan_coords[1],
                                                            account['username'])
                     log.exception('{}. Exception message: {}'.format(
                         status['message'], repr(e)))
+                finally:
                     if response_dict is not None:
                         del response_dict
 
@@ -1056,7 +1092,7 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
 
                         # Can only get gym details within 1km of our position.
                         gym_distance = distance(
-                            step_location, [gym['latitude'], gym['longitude']])
+                            scan_coords, [gym['latitude'], gym['longitude']])
                         if gym_distance < 1000:
                             # Check if we already have details on this gym.
                             # Get them if not.
@@ -1083,7 +1119,7 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                                 'Skipping update of gym @ %f/%f, too far ' +
                                 'away from our location at %f/%f (%.0fm).',
                                 gym['latitude'], gym['longitude'],
-                                step_location[0], step_location[1],
+                                scan_coords[0], scan_coords[1],
                                 gym_distance)
 
                     if len(gyms_to_update):
@@ -1091,8 +1127,8 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                         current_gym = 1
                         status['message'] = (
                             'Updating {} gyms for location {},{}...').format(
-                                len(gyms_to_update), step_location[0],
-                                step_location[1])
+                                len(gyms_to_update), scan_coords[0],
+                                scan_coords[1])
                         log.debug(status['message'])
 
                         for gym in gyms_to_update.values():
@@ -1101,17 +1137,17 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                                 'Getting details for gym {} of {} for ' +
                                 'location {:6f},{:6f}...').format(
                                     current_gym,
-                                    len(gyms_to_update), step_location[0],
-                                    step_location[1])
+                                    len(gyms_to_update), scan_coords[0],
+                                    scan_coords[1])
                             log.info('Getting details for gym @ %f/%f ' +
                                      '(%.0fm away)', gym['latitude'],
                                      gym['longitude'],
-                                     distance(step_location, [
+                                     distance(scan_coords, [
                                          gym['latitude'], gym['longitude']
                                      ]))
 
                             response = gym_get_info(api, account,
-                                                    step_location, gym)
+                                                    scan_coords, gym)
 
                             # Make sure the gym was in range. (Sometimes the
                             # API gets cranky about gyms that are ALMOST 1km
@@ -1132,8 +1168,8 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
                         status['message'] = (
                             'Processing details of {} gyms for location ' +
                             '{:6f},{:6f}...').format(len(gyms_to_update),
-                                                     step_location[0],
-                                                     step_location[1])
+                                                     scan_coords[0],
+                                                     scan_coords[1])
                         log.debug(status['message'])
 
                         if gym_responses:
@@ -1201,15 +1237,18 @@ def search_worker_thread(args, account_queue, account_sets, account_failures,
 
 
 def upsertKeys(keys, key_scheduler, db_updates_queue):
-    # Prepare hashing keys to be sent to the db. But only
-    # sent latest updates of the 'peak' value per key.
+    # Prepare hashing keys to be sent to the database.
+    # Keep highest peak value stored.
     hashkeys = {}
-    for key in keys:
-        key_instance = key_scheduler.keys[key]
-        hashkeys[key] = key_instance
+    stored_peaks = HashKeys.get_stored_peaks()
+    for key, instance in key_scheduler.keys.iteritems():
+        hashkeys[key] = instance
         hashkeys[key]['key'] = key
-        hashkeys[key]['peak'] = max(key_instance['peak'],
-                                    HashKeys.getStoredPeak(key))
+
+        if key in stored_peaks:
+            max_peak = max(instance['peak'], stored_peaks[key])
+            hashkeys[key]['peak'] = max_peak
+
     db_updates_queue.put((HashKeys, hashkeys))
 
 

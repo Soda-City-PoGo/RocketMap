@@ -1,10 +1,27 @@
 /* Main stats page */
 var rawDataIsLoading = false
 var statusPagePassword = false
-var groupByWorker = true
 var showHashTable = true
-var showWorkersTable = true
+var showInstances = true
+var showWorkers = true
 var hashkeys = {}
+var statshash = 'summarystats'  /* unique statistics worker name */
+var scansSuccess
+var scansFailed
+var scansEmpty
+var scansSkipped
+var captchasCount
+var mainWorkers
+var elapsedTotal
+var elapsedSecs
+var elapsedHours
+var successPerHour
+var failsPerHour
+var emptyPerHour
+var skippedPerHour
+var captchasPerHour
+var captchasCost
+var captchasCostMonthly
 
 // Raw data updating
 var minUpdateDelay = 1000 // Minimum delay between updates (in ms).
@@ -19,16 +36,30 @@ function getFormattedDate(unFormattedDate) { // eslintrc no-undef.
  * Workers
  */
 function addMainWorker(hash) {
-    var worker = `
-     <div id="worker_${hash}" class="worker">
-       <span id="name_${hash}" class="name"></span>
-       <span id="method_${hash}" class="method"></span>
-       <span id="message_${hash}" class="message"></span>
-     </div>
-   `
+    var worker
+    if (showInstances && !showWorkers) {
+        worker = `
+        <div id="worker_${hash}" class="worker">
+            <span id="name_${hash}" class="name"></span>
+            <span id="method_${hash}" class="method"></span>
+            <span id="message_${hash}" class="message"></span>
+            <br>
+        </div>
+        `
+    } else {
+        worker = `
+        <div id="worker_${hash}" class="worker">
+            <span id="name_${hash}" class="name"></span>
+            <span id="method_${hash}" class="method"></span>
+            <span id="message_${hash}" class="message"></span>
+        </div>
+        `
+    }
 
     $(worker).appendTo('#status_container')
-    addTable(hash)
+    if (showWorkers) {
+        addTable(hash)
+    }
 }
 
 function processMainWorker(i, worker) {
@@ -76,9 +107,9 @@ function addHashtable(mainKeyHash, keyHash) {
 }
 
 function processWorker(i, worker) {
-    var hash = hashFnv32a(worker['username'], true)
+    const hash = hashFnv32a(worker['username'], true)
     var mainWorkerHash
-    if (groupByWorker) {
+    if (showWorkers && showInstances) {
         mainWorkerHash = hashFnv32a(worker['worker_name'], true)
         if ($('#table_' + mainWorkerHash).length === 0) {
             return
@@ -94,7 +125,7 @@ function processWorker(i, worker) {
         addWorker(mainWorkerHash, hash)
     }
 
-    var lastModified = getFormattedDate(new Date(worker['last_modified']))
+    const lastModified = getFormattedDate(new Date(worker['last_modified']))
 
     $('#username_' + hash).html(worker['username'])
     $('#success_' + hash).html(worker['success'])
@@ -107,15 +138,15 @@ function processWorker(i, worker) {
 }
 
 function processHashKeys(i, hashkey) {
-    var key = hashkey['key']
-    var keyHash = hashFnv32a(key, true)
+    const key = hashkey['key']
+    const keyHash = hashFnv32a(key, true)
     if ($('#hashtable_global').length === 0) {
         createHashTable('global')
     }
 
     if ($('#hashrow_' + keyHash).length === 0) {
         addHashtable('global', keyHash)
-        var keyValues = {
+        const keyValues = {
             samples: [],
             nextSampleIndex: 0
         }
@@ -124,18 +155,18 @@ function processHashKeys(i, hashkey) {
     }
 
     // Calculate average value for Hash keys.
-    var writeIndex = hashkeys[key].nextSampleIndex % 60
+    const writeIndex = hashkeys[key].nextSampleIndex % 60
     hashkeys[key].nextSampleIndex += 1
     hashkeys[key].samples[writeIndex] = hashkey['maximum'] - hashkey['remaining']
-    var numSamples = hashkeys[key].samples.length
+    const numSamples = hashkeys[key].samples.length
     var sumSamples = 0
     for (var j = 0; j < numSamples; j++) {
         sumSamples += hashkeys[key].samples[j]
     }
 
-    var usage = sumSamples / Math.max(numSamples, 1) // Avoid division by zero.
+    const usage = sumSamples / Math.max(numSamples, 1) // Avoid division by zero.
 
-    var lastUpdated = getFormattedDate(new Date(hashkey['last_updated']))
+    const lastUpdated = getFormattedDate(new Date(hashkey['last_updated']))
     var expires = getFormattedDate(new Date(hashkey['expires']))
     if (!moment(expires).unix()) {
         expires = 'Unknown/Invalid'
@@ -153,10 +184,11 @@ function processHashKeys(i, hashkey) {
 }
 
 function parseResult(result) {
-    if (groupByWorker && showWorkersTable) {
+    addTotalStats(result)
+    if (showInstances) {
         $.each(result.main_workers, processMainWorker)
     }
-    if (showWorkersTable) {
+    if (showWorkers) {
         $.each(result.workers, processWorker)
     }
     if (showHashTable) {
@@ -308,6 +340,95 @@ function updateStatus() {
     })
 }
 
+/*
+ * Generate Statistics Across All Workers
+ */
+function addStatsWorker(hash) {
+    var worker = `
+    <div id="worker_${hash}" class="worker">
+    <span id="name_${hash}" class="name"></span>
+    <span id="method_${hash}" class="method"></span>
+    <span id="message_${hash}" class="message"></span>
+    </div>
+    `
+
+    $('#stats_worker').html(worker)
+}
+
+function getStats(i, worker) {
+    scansSuccess += worker['success']
+    scansFailed += worker['fail']
+    scansEmpty += worker['empty']
+    scansSkipped += worker['skip']
+    captchasCount += worker['captcha']
+    mainWorkers += 1
+
+    elapsedTotal += worker['elapsed']
+    elapsedSecs = elapsedTotal / (i + 1)
+    elapsedHours = elapsedSecs / 3600
+}
+
+function addTotalStats(result) {
+    var statmsg, title
+    scansSuccess = 0
+    scansFailed = 0
+    scansEmpty = 0
+    scansSkipped = 0
+    captchasCount = 0
+    mainWorkers = 0
+    elapsedTotal = 0
+    elapsedSecs = 0
+    elapsedHours = 0
+    successPerHour = 0
+    failsPerHour = 0
+    emptyPerHour = 0
+    skippedPerHour = 0
+    captchasPerHour = 0
+    captchasCost = 0
+    captchasCostMonthly = 0
+
+    $.each(result.main_workers, getStats)
+
+    if ((mainWorkers > 1) || !(showWorkers && showInstances)) {
+        const accountsActive = result.workers.length
+
+        // Calculate the number of idle workers and then busy from that.
+        const accountsIdle = result.workers.reduce((accumulator, account) => {
+            if (account['message'] === 'Nothing to scan.') {
+                accumulator += 1
+            }
+            return accumulator
+        }, 0)
+
+        const accountsBusy = result.workers.length - accountsIdle
+
+        // Avoid division by zero.
+        elapsedSecs = Math.max(elapsedSecs, 1)
+
+        successPerHour = (scansSuccess * 3600 / elapsedSecs) || 0
+        failsPerHour = (scansFailed * 3600 / elapsedSecs) || 0
+        emptyPerHour = (scansEmpty * 3600 / elapsedSecs) || 0
+        skippedPerHour = (scansSkipped * 3600 / elapsedSecs) || 0
+        captchasPerHour = (captchasCount * 3600 / elapsedSecs) || 0
+        captchasCost = captchasPerHour * 0.00299
+        captchasCostMonthly = captchasCost * 730
+
+        if ($('#worker_' + statshash).length === 0) {
+            addStatsWorker(statshash)
+        }
+
+        statmsg = 'Total active: ' + accountsActive + ', busy: ' + accountsBusy + ', idle: ' + accountsIdle + ' | Success: ' + scansSuccess.toFixed() + ' (' + successPerHour.toFixed(1) + '/hr) | Fails: ' + scansFailed.toFixed() + ' (' + failsPerHour.toFixed(1) + '/hr) | Empties: ' + scansEmpty.toFixed() + ' (' + emptyPerHour.toFixed(1) + '/hr) | Skips: ' + scansSkipped.toFixed() + ' (' + skippedPerHour.toFixed(1) + '/hr) | Captchas: ' + captchasCount.toFixed() + ' (' + captchasPerHour.toFixed(1) + '/hr) ($' + captchasCost.toFixed(2) + '/hr, $' + captchasCostMonthly.toFixed(2) + '/mo) | Elapsed:  ' + elapsedHours.toFixed(1) + 'h<hr />'
+        if (mainWorkers > 1) {
+            title = '(Total Statistics across ' + mainWorkers + ' instances)'
+        } else {
+            title = '(Total Statistics across ' + mainWorkers + ' instance)'
+        }
+        $('#name_' + statshash).html('All Instances')
+        $('#method_' + statshash).html(title)
+        $('#message_' + statshash).html(statmsg)
+    }
+}
+
 /**
  * Calculate a 32 bit FNV-1a hash
  * Found here: https://gist.github.com/vaiorabbit/5657561
@@ -384,12 +505,6 @@ $(document).ready(function () {
         })
     })
 
-    $('#groupbyworker-switch').change(function () {
-        groupByWorker = this.checked
-
-        $('#status_container .status_table').remove()
-        $('#status_container .worker').remove()
-    })
 
     $('#hashkey-switch').change(function () {
         showHashTable = this.checked
@@ -399,7 +514,14 @@ $(document).ready(function () {
     })
 
     $('#showworker-switch').change(function () {
-        showWorkersTable = this.checked
+        showWorkers = this.checked
+
+        $('#status_container .status_table').remove()
+        $('#status_container .worker').remove()
+    })
+
+    $('#showinstances-switch').change(function () {
+        showInstances = this.checked
 
         $('#status_container .status_table').remove()
         $('#status_container .worker').remove()

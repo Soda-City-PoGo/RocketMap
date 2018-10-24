@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import sys
-import configargparse
 import os
 import json
 import logging
@@ -12,6 +11,9 @@ import socket
 import struct
 import hashlib
 import psutil
+import subprocess
+import requests
+import configargparse
 
 from s2sphere import CellId, LatLng
 from geopy.geocoders import GoogleV3
@@ -19,6 +21,11 @@ from requests_futures.sessions import FuturesSession
 from requests.packages.urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from cHaversine import haversine
+from pprint import pformat
+from time import strftime
+from timeit import default_timer
+
+from pgoapi.hash_server import HashServer
 
 log = logging.getLogger(__name__)
 
@@ -80,11 +87,11 @@ def get_args():
                               'or are switched out.'))
     parser.add_argument('-ac', '--accountcsv',
                         help=('Load accounts from CSV file containing ' +
-                              '"auth_service,username,passwd" lines.'))
+                              '"auth_service,username,password" lines.'))
     parser.add_argument('-hlvl', '--high-lvl-accounts',
                         help=('Load high level accounts from CSV file '
                               + ' containing '
-                              + '"auth_service,username,passwd"'
+                              + '"auth_service,username,password"'
                               + ' lines.'))
     parser.add_argument('-bh', '--beehive',
                         help=('Use beehive configuration for multiple ' +
@@ -112,9 +119,9 @@ def get_args():
                               ' rather than only once, and store results in' +
                               ' the database.'),
                         action='store_true', default=False)
-    parser.add_argument('-nj', '--no-jitter',
-                        help=("Don't apply random -9m to +9m jitter to " +
-                              "location."),
+    parser.add_argument('-j', '--jitter',
+                        help=('Apply random -5m to +5m jitter to ' +
+                              'location.'),
                         action='store_true', default=False)
     parser.add_argument('-al', '--access-logs',
                         help=("Write web logs to access.log."),
@@ -275,8 +282,6 @@ def get_args():
                         action='store_true', default=False)
     parser.add_argument('-C', '--cors', help='Enable CORS on web server.',
                         action='store_true', default=False)
-    parser.add_argument('-D', '--db', help='Database filename for SQLite.',
-                        default='pogom.db')
     parser.add_argument('-cd', '--clear-db',
                         help=('Deletes the existing database before ' +
                               'starting the Webserver.'),
@@ -301,7 +306,11 @@ def get_args():
                         help=('Use spawnpoint scanning (instead of hex ' +
                               'grid). Scans in a circle based on step_limit ' +
                               'when on DB.'),
-                        nargs='?', const='nofile', default=False)
+                        action='store_true', default=False)
+    parser.add_argument('-ssct', '--ss-cluster-time',
+                        help=('Time threshold in seconds for spawn point ' +
+                              'clustering (0 to disable).'),
+                        type=int, default=0)
     parser.add_argument('-speed', '--speed-scan',
                         help=('Use speed scanning to identify spawn points ' +
                               'and then scan closest spawns.'),
@@ -311,27 +320,20 @@ def get_args():
                         action='store_true', default=False)
     parser.add_argument('-ams', '--account-max-spins',
                         help='Maximum number of Pokestop spins per hour.',
-                        type=int, default=80)
+                        type=int, default=20)
     parser.add_argument('-kph', '--kph',
                         help=('Set a maximum speed in km/hour for scanner ' +
-                              'movement.'),
+                              'movement. Default: 35, 0 to disable.'),
                         type=int, default=35)
     parser.add_argument('-hkph', '--hlvl-kph',
                         help=('Set a maximum speed in km/hour for scanner ' +
-                              'movement, for high-level (L30) accounts.'),
+                              'movement, for high-level (L30) accounts. ' +
+                              'Default: 25, 0 to disable.'),
                         type=int, default=25)
     parser.add_argument('-ldur', '--lure-duration',
                         help=('Change duration for lures set on pokestops. ' +
                               'This is useful for events that extend lure ' +
                               'duration.'), type=int, default=30)
-    parser.add_argument('--dump-spawnpoints',
-                        help=('Dump the spawnpoints from the db to json ' +
-                              '(only for use with -ss).'),
-                        action='store_true', default=False)
-    parser.add_argument('-pd', '--purge-data',
-                        help=('Clear Pokemon from database this many hours ' +
-                              'after they disappear (0 to disable).'),
-                        type=int, default=0)
     parser.add_argument('-px', '--proxy',
                         help='Proxy url (e.g. socks5://127.0.0.1:9050)',
                         action='append')
@@ -368,27 +370,64 @@ def get_args():
                         help=('Enable proxy rotation with account changing ' +
                               'for search threads (none/round/random).'),
                         type=str, default='round')
-    parser.add_argument('--db-type',
-                        help='Type of database to be used (default: sqlite).',
-                        default='sqlite')
-    parser.add_argument('--db-name', help='Name of the database to be used.')
-    parser.add_argument('--db-user', help='Username for the database.')
-    parser.add_argument('--db-pass', help='Password for the database.')
-    parser.add_argument('--db-host', help='IP or hostname for the database.')
-    parser.add_argument(
+    group = parser.add_argument_group('Database')
+    group.add_argument(
+        '--db-name', help='Name of the database to be used.', required=True)
+    group.add_argument(
+        '--db-user', help='Username for the database.', required=True)
+    group.add_argument(
+        '--db-pass', help='Password for the database.', required=True)
+    group.add_argument(
+        '--db-host',
+        help='IP or hostname for the database.',
+        default='127.0.0.1')
+    group.add_argument(
         '--db-port', help='Port for the database.', type=int, default=3306)
-    parser.add_argument('--db-threads',
-                        help=('Number of db threads; increase if the db ' +
-                              'queue falls behind.'),
-                        type=int, default=1)
-    parser.add_argument('-wh', '--webhook',
-                        help='Define URL(s) to POST webhook information to.',
-                        default=None, dest='webhooks', action='append')
+    group.add_argument(
+        '--db-threads',
+        help=('Number of db threads; increase if the db ' +
+              'queue falls behind.'),
+        type=int,
+        default=1)
+    group = parser.add_argument_group('Database Cleanup')
+    group.add_argument('-DC', '--db-cleanup',
+                       help='Enable regular database cleanup thread.',
+                       action='store_true', default=False)
+    group.add_argument('-DCw', '--db-cleanup-worker',
+                       help=('Clear worker status from database after X ' +
+                             'minutes of inactivity. ' +
+                             'Default: 30, 0 to disable.'),
+                       type=int, default=30)
+    group.add_argument('-DCp', '--db-cleanup-pokemon',
+                       help=('Clear pokemon from database X hours ' +
+                             'after they disappeared. ' +
+                             'Default: 0, 0 to disable.'),
+                       type=int, default=0)
+    group.add_argument('-DCg', '--db-cleanup-gym',
+                       help=('Clear gym details from database X hours ' +
+                             'after last gym scan. ' +
+                             'Default: 8, 0 to disable.'),
+                       type=int, default=8)
+    group.add_argument('-DCs', '--db-cleanup-spawnpoint',
+                       help=('Clear spawnpoint from database X hours ' +
+                             'after last valid scan. ' +
+                             'Default: 720, 0 to disable.'),
+                       type=int, default=720)
+    group.add_argument('-DCf', '--db-cleanup-forts',
+                       help=('Clear gyms and pokestops from database X hours '
+                             'after last valid scan. '
+                             'Default: 0, 0 to disable.'),
+                       type=int, default=0)
+    parser.add_argument(
+        '-wh',
+        '--webhook',
+        help='Define URL(s) to POST webhook information to.',
+        default=None,
+        dest='webhooks',
+        action='append')
     parser.add_argument('-gi', '--gym-info',
                         help=('Get all details about gyms (causes an ' +
                               'additional API hit for every gym).'),
-                        action='store_true', default=False)
-    parser.add_argument('-DC', '--enable-clean', help='Enable DB cleaner.',
                         action='store_true', default=False)
     parser.add_argument(
         '--wh-types',
@@ -410,8 +449,13 @@ def get_args():
                         help=('Number of times to retry sending webhook ' +
                               'data on failure.'),
                         type=int, default=3)
-    parser.add_argument('-wht', '--wh-timeout',
-                        help='Timeout (in seconds) for webhook requests.',
+    parser.add_argument('-whct', '--wh-connect-timeout',
+                        help=('Connect timeout (in seconds) for webhook' +
+                              ' requests.'),
+                        type=float, default=1.0)
+    parser.add_argument('-whrt', '--wh-read-timeout',
+                        help=('Read timeout (in seconds) for webhook' +
+                              'requests.'),
                         type=float, default=1.0)
     parser.add_argument('-whbf', '--wh-backoff-factor',
                         help=('Factor (in seconds) by which the delay ' +
@@ -441,10 +485,17 @@ def get_args():
     parser.add_argument('-sn', '--status-name', default=str(os.getpid()),
                         help=('Enable status page database update using ' +
                               'STATUS_NAME as main worker name.'))
-    parser.add_argument('-spp', '--status-page-password', default=None,
-                        help='Set the status page password.')
     parser.add_argument('-hk', '--hash-key', default=None, action='append',
-                        help='Key for hash server')
+                        help='Key for hash server.')
+    parser.add_argument('-hs', '--hash-service', default='bossland', type=str,
+                        help=('Hash service name. Supports bossland and'
+                              ' devkat hashing.'),
+                        choices=['bossland', 'devkat'])
+    parser.add_argument('--hash-header-sleep',
+                        help=('Use the BossLand headers to determine how long'
+                              ' a worker should sleep if it exceeds the'
+                              ' hashing quota. Default: False.'),
+                        action='store_true', default=False)
     parser.add_argument('-novc', '--no-version-check', action='store_true',
                         help='Disable API version check.',
                         default=False)
@@ -452,9 +503,6 @@ def get_args():
                         help='Interval to check API version in seconds ' +
                         '(Default: in [60, 300]).',
                         default=random.randint(60, 300))
-    parser.add_argument('-el', '--encrypt-lib',
-                        help=('Path to encrypt lib to be used instead of ' +
-                              'the shipped ones.'))
     parser.add_argument('-odt', '--on-demand_timeout',
                         help=('Pause searching while web UI is inactive ' +
                               'for this timeout (in seconds).'),
@@ -467,7 +515,7 @@ def get_args():
                         help=('Enables the use of X-FORWARDED-FOR headers ' +
                               'to identify the IP of clients connecting ' +
                               'through these trusted proxies.'))
-    parser.add_argument('--api-version', default='0.75.0',
+    parser.add_argument('--api-version', default='0.91.2',
                         help=('API version currently in use.'))
     parser.add_argument('--no-file-logs',
                         help=('Disable logging to files. ' +
@@ -476,6 +524,23 @@ def get_args():
     parser.add_argument('--log-path',
                         help=('Defines directory to save log files to.'),
                         default='logs/')
+    parser.add_argument('--log-filename',
+                        help=('Defines the log filename to be saved.'
+                              ' Allows date formatting, and replaces <SN>'
+                              " with the instance's status name. Read the"
+                              ' python time module docs for details.'
+                              ' Default: %%Y%%m%%d_%%H%%M_<SN>.log.'),
+                        default='%Y%m%d_%H%M_<SN>.log'),
+    parser.add_argument('--dump',
+                        help=('Dump censored debug info about the ' +
+                              'environment and auto-upload to ' +
+                              'hastebin.com.'),
+                        action='store_true', default=False)
+    parser.add_argument('-exg', '--ex-gyms',
+                        help=('Fetch OSM parks within geofence and flag ' +
+                              'gyms that are candidates for EX raids. ' +
+                              'Only required once per area.'),
+                        action='store_true', default=False)
     verbose = parser.add_mutually_exclusive_group()
     verbose.add_argument('-v',
                          help=('Show debug messages from RocketMap ' +
@@ -485,9 +550,32 @@ def get_args():
                          help=('Show debug messages from RocketMap ' +
                                'and pgoapi.'),
                          type=int, dest='verbose')
+    rarity = parser.add_argument_group('Dynamic Rarity')
+    rarity.add_argument('-Rh', '--rarity-hours',
+                        help=('Number of hours of Pokemon data to use ' +
+                              'to calculate dynamic rarity. Decimals ' +
+                              'allowed. Default: 48, 0 to use all data.'),
+                        type=float, default=48)
+    rarity.add_argument('-Rf', '--rarity-update-frequency',
+                        help=('How often (in minutes) the dynamic rarity ' +
+                              'should be updated. Decimals allowed. ' +
+                              'Default: 0, 0 to disable.'),
+                        type=float, default=0)
+    statusp = parser.add_argument_group('Status Page')
+    statusp.add_argument('-SPp', '--status-page-password', default=None,
+                         help='Set the status page password.')
+    statusp.add_argument('-SPf', '--status-page-filter',
+                         help=('Filter worker status that are inactive for ' +
+                               'X minutes. Default: 30, 0 to disable.'),
+                         type=int, default=30)
     parser.set_defaults(DEBUG=False)
 
     args = parser.parse_args()
+
+    # Allow status name and date formatting in log filename.
+    args.log_filename = strftime(args.log_filename)
+    args.log_filename = args.log_filename.replace('<sn>', '<SN>')
+    args.log_filename = args.log_filename.replace('<SN>', args.status_name)
 
     if args.only_server:
         if args.location is None:
@@ -519,7 +607,8 @@ def get_args():
                     csv_input.append('<username>,<password>')
                     csv_input.append('<ptc/google>,<username>,<password>')
 
-                    # If the number of fields is differend this is not a CSV.
+                    # If the number of fields is different,
+                    # then this is not a CSV.
                     if num_fields != line.count(',') + 1:
                         print(sys.argv[0] +
                               ": Error parsing CSV file on line " + str(num) +
@@ -567,7 +656,7 @@ def get_args():
 
                     # If the number of fields is three then assume this is
                     # "ptc,username,password". As requested.
-                    if num_fields == 3:
+                    if num_fields >= 3:
                         # If field 0 is not ptc or google something is wrong!
                         if (fields[0].lower() == 'ptc' or
                                 fields[0].lower() == 'google'):
@@ -588,12 +677,6 @@ def get_args():
                             args.password.append(fields[2])
                         else:
                             field_error = 'password'
-
-                    if num_fields > 3:
-                        print(('Too many fields in accounts file: max ' +
-                               'supported are 3 fields. ' +
-                               'Found {} fields').format(num_fields))
-                        sys.exit(1)
 
                     # If something is wrong display error.
                     if field_error != '':
@@ -687,7 +770,7 @@ def get_args():
 
                     line = line.split(',')
 
-                    # We need "service, user, pass".
+                    # We need "service, username, password".
                     if len(line) < 3:
                         raise Exception('L30 account is missing a'
                                         + ' field. Each line requires: '
@@ -771,6 +854,19 @@ def get_args():
 
     args.locales_dir = 'static/dist/locales'
     args.data_dir = 'static/dist/data'
+
+    # Set hashing endpoint. 'bossland' doesn't need to be added here, it's
+    # the default in the API.
+    legal_endpoints = {
+        'devkat': 'https://hashing.devkat.org'
+    }
+
+    hash_service = args.hash_service.lower()
+    endpoint = legal_endpoints.get(hash_service, False)
+    if endpoint:
+        log.info('Using hash service: %s.', hash_service)
+        HashServer.endpoint = endpoint
+
     return args
 
 
@@ -798,7 +894,9 @@ def clock_between(start, test, end):
 
 # Return the s2sphere cellid token from a location.
 def cellid(loc):
-    return CellId.from_lat_lng(LatLng.from_degrees(loc[0], loc[1])).to_token()
+    return int(
+        CellId.from_lat_lng(LatLng.from_degrees(loc[0], loc[1])).to_token(),
+        16)
 
 
 # Return approximate distance in meters.
@@ -836,6 +934,38 @@ def i8ln(word):
         return word
 
 
+# Thread function for periodical enc list updating.
+def dynamic_loading_refresher(file_list):
+    # We're on a 60-second timer.
+    refresh_time_sec = 60
+
+    while True:
+        # Wait (x-1) seconds before refresh, min. 1s.
+        time.sleep(max(1, refresh_time_sec - 1))
+
+        for arg_type, filename in file_list.items():
+            try:
+                # IV/CP scanning.
+                if filename:
+                    # Only refresh if the file has changed.
+                    current_time_sec = time.time()
+                    file_modified_time_sec = os.path.getmtime(filename)
+                    time_diff_sec = current_time_sec - file_modified_time_sec
+
+                    # File has changed in the last refresh_time_sec seconds.
+                    if time_diff_sec < refresh_time_sec:
+                        args = get_args()
+                        with open(filename) as f:
+                            new_list = frozenset([int(l.strip()) for l in f])
+                            setattr(args, arg_type, new_list)
+                            log.info('New %s is: %s.', arg_type, new_list)
+                    else:
+                        log.debug('No change found in %s.', filename)
+            except Exception as e:
+                log.exception('Exception occurred while' +
+                              ' updating %s: %s.', arg_type, e)
+
+
 def get_pokemon_data(pokemon_id):
     if not hasattr(get_pokemon_data, 'pokemon'):
         args = get_args()
@@ -851,10 +981,6 @@ def get_pokemon_data(pokemon_id):
 
 def get_pokemon_name(pokemon_id):
     return i8ln(get_pokemon_data(pokemon_id)['name'])
-
-
-def get_pokemon_rarity(pokemon_id):
-    return i8ln(get_pokemon_data(pokemon_id)['rarity'])
 
 
 def get_pokemon_types(pokemon_id):
@@ -899,11 +1025,7 @@ def dottedQuadToNum(ip):
 
 # Generate random device info.
 # Original by Noctem.
-IPHONES = {'iPhone5,1': 'N41AP',
-           'iPhone5,2': 'N42AP',
-           'iPhone5,3': 'N48AP',
-           'iPhone5,4': 'N49AP',
-           'iPhone6,1': 'N51AP',
+IPHONES = {'iPhone6,1': 'N51AP',
            'iPhone6,2': 'N53AP',
            'iPhone7,1': 'N56AP',
            'iPhone7,2': 'N61AP',
@@ -913,7 +1035,13 @@ IPHONES = {'iPhone5,1': 'N41AP',
            'iPhone9,1': 'D10AP',
            'iPhone9,2': 'D11AP',
            'iPhone9,3': 'D101AP',
-           'iPhone9,4': 'D111AP'}
+           'iPhone9,4': 'D111AP',
+           'iPhone10,1': 'D20AP',
+           'iPhone10,2': 'D21AP',
+           'iPhone10,3': 'D22AP',
+           'iPhone10,4': 'D201AP',
+           'iPhone10,5': 'D211AP',
+           'iPhone10,6': 'D221AP'}
 
 
 def generate_device_info(identifier):
@@ -926,28 +1054,31 @@ def generate_device_info(identifier):
                    'firmware_brand': 'iPhone OS'}
     devices = tuple(IPHONES.keys())
 
-    ios8 = ('8.0', '8.0.1', '8.0.2', '8.1', '8.1.1', '8.1.2', '8.1.3', '8.2',
-            '8.3', '8.4', '8.4.1')
     ios9 = ('9.0', '9.0.1', '9.0.2', '9.1', '9.2', '9.2.1', '9.3', '9.3.1',
             '9.3.2', '9.3.3', '9.3.4', '9.3.5')
     # 10.0 was only for iPhone 7 and 7 Plus, and is rare.
     ios10 = ('10.0.1', '10.0.2', '10.0.3', '10.1', '10.1.1', '10.2', '10.2.1',
              '10.3', '10.3.1', '10.3.2', '10.3.3')
+    ios11 = ('11.0.1', '11.0.2', '11.0.3', '11.1', '11.1.1', '11.1.2')
 
     device_pick = devices[pick_hash % len(devices)]
     device_info['device_model_boot'] = device_pick
     device_info['hardware_model'] = IPHONES[device_pick]
     device_info['device_id'] = md5.hexdigest()
 
-    if device_pick in ('iPhone9,1', 'iPhone9,2', 'iPhone9,3', 'iPhone9,4'):
-        ios_pool = ios10
-    elif device_pick in ('iPhone8,1', 'iPhone8,2'):
-        ios_pool = ios9 + ios10
+    if device_pick in ('iPhone10,1', 'iPhone10,2', 'iPhone10,3',
+                       'iPhone10,4', 'iPhone10,5', 'iPhone10,6'):
+        # iPhone 8/8+ and X started on 11.
+        ios_pool = ios11
+    elif device_pick in ('iPhone9,1', 'iPhone9,2', 'iPhone9,3', 'iPhone9,4'):
+        # iPhone 7/7+ started on 10.
+        ios_pool = ios10 + ios11
     elif device_pick == 'iPhone8,4':
         # iPhone SE started on 9.3.
-        ios_pool = ('9.3', '9.3.1', '9.3.2', '9.3.3', '9.3.4', '9.3.5') + ios10
+        ios_pool = ('9.3', '9.3.1', '9.3.2', '9.3.3', '9.3.4', '9.3.5') \
+                   + ios10 + ios11
     else:
-        ios_pool = ios8 + ios9 + ios10
+        ios_pool = ios9 + ios10 + ios11
 
     device_info['firmware_type'] = ios_pool[pick_hash % len(ios_pool)]
     return device_info
@@ -1123,3 +1254,234 @@ def log_resource_usage_loop(loop_delay_ms=60000):
         log_resource_usage(log.debug)
 
     periodic_loop(log_resource_usage_to_debug, loop_delay_ms)
+
+
+# Return shell call output as string, replacing any errors with the
+# error's string representation.
+def check_output_catch(command):
+    try:
+        result = subprocess.check_output(command,
+                                         stderr=subprocess.STDOUT,
+                                         shell=True)
+    except Exception as ex:
+        result = 'ERROR: ' + ex.output.replace(os.linesep, ' ')
+    finally:
+        return result.strip()
+
+
+# Automatically censor all necessary fields. Lists will return their
+# length, all other items will return 'empty_tag' if they're empty
+# or 'censored_tag' if not.
+def _censor_args_namespace(args, censored_tag, empty_tag):
+    fields_to_censor = [
+        'accounts',
+        'accounts_L30',
+        'username',
+        'password',
+        'auth_service',
+        'proxy',
+        'webhooks',
+        'webhook_blacklist',
+        'webhook_whitelist',
+        'config',
+        'accountcsv',
+        'high_lvl_accounts',
+        'geofence_file',
+        'geofence_excluded_file',
+        'ignorelist_file',
+        'enc_whitelist_file',
+        'webhook_whitelist_file',
+        'webhook_blacklist_file',
+        'db',
+        'proxy_file',
+        'log_path',
+        'log_filename',
+        'encrypt_lib',
+        'ssl_certificate',
+        'ssl_privatekey',
+        'location',
+        'captcha_key',
+        'captcha_dsk',
+        'manual_captcha_domain',
+        'host',
+        'port',
+        'gmaps_key',
+        'db_name',
+        'db_user',
+        'db_pass',
+        'db_host',
+        'db_port',
+        'status_name',
+        'status_page_password',
+        'hash_key',
+        'trusted_proxies',
+        'data_dir',
+        'locales_dir',
+        'shared_config'
+    ]
+
+    for field in fields_to_censor:
+        # Do we have the field?
+        if field in args:
+            value = args[field]
+
+            # Replace with length of list or censored tag.
+            if isinstance(value, list):
+                args[field] = len(value)
+            else:
+                if args[field]:
+                    args[field] = censored_tag
+                else:
+                    args[field] = empty_tag
+
+    return args
+
+
+# Get censored debug info about the environment we're running in.
+def get_censored_debug_info():
+    CENSORED_TAG = '<censored>'
+    EMPTY_TAG = '<empty>'
+    args = _censor_args_namespace(vars(get_args()), CENSORED_TAG, EMPTY_TAG)
+
+    # Get git status.
+    status = check_output_catch('git status')
+    log = check_output_catch('git log -1')
+    remotes = check_output_catch('git remote -v')
+
+    # Python, pip, node, npm.
+    python = sys.version.replace(os.linesep, ' ').strip()
+    pip = check_output_catch('pip -V')
+    node = check_output_catch('node -v')
+    npm = check_output_catch('npm -v')
+
+    return {
+        'args': args,
+        'git': {
+            'status': status,
+            'log': log,
+            'remotes': remotes
+        },
+        'versions': {
+            'python': python,
+            'pip': pip,
+            'node': node,
+            'npm': npm
+        }
+    }
+
+
+# Post a string of text to a hasteb.in and retrieve the URL.
+def upload_to_hastebin(text):
+    log.info('Uploading info to hastebin.com...')
+    response = requests.post('https://hastebin.com/documents', data=text)
+    return response.json()['key']
+
+
+# Get censored debug info & auto-upload to hasteb.in.
+def get_debug_dump_link():
+    debug = get_censored_debug_info()
+    args = debug['args']
+    git = debug['git']
+    versions = debug['versions']
+
+    # Format debug info for text upload.
+    result = '''#######################
+### RocketMap debug ###
+#######################
+
+## Versions:
+'''
+
+    # Versions first, for readability.
+    result += '- Python: ' + versions['python'] + '\n'
+    result += '- pip: ' + versions['pip'] + '\n'
+    result += '- Node.js: ' + versions['node'] + '\n'
+    result += '- npm: ' + versions['npm'] + '\n'
+
+    # Next up is git.
+    result += '\n\n' + '## Git:' + '\n'
+    result += git['status'] + '\n'
+    result += '\n\n' + git['remotes'] + '\n'
+    result += '\n\n' + git['log'] + '\n'
+
+    # And finally, our censored args.
+    result += '\n\n' + '## Settings:' + '\n'
+    result += pformat(args, width=1)
+
+    # Upload to hasteb.in.
+    return upload_to_hastebin(result)
+
+
+def get_pokemon_rarity(total_spawns_all, total_spawns_pokemon):
+    spawn_group = 'Common'
+
+    spawn_rate_pct = total_spawns_pokemon / float(total_spawns_all)
+    spawn_rate_pct = round(100 * spawn_rate_pct, 4)
+
+    if spawn_rate_pct < 0.01:
+        spawn_group = 'Ultra Rare'
+    elif spawn_rate_pct < 0.03:
+        spawn_group = 'Very Rare'
+    elif spawn_rate_pct < 0.5:
+        spawn_group = 'Rare'
+    elif spawn_rate_pct < 1:
+        spawn_group = 'Uncommon'
+
+    return spawn_group
+
+
+def dynamic_rarity_refresher():
+    # If we import at the top, pogom.models will import pogom.utils,
+    # causing the cyclic import to make some things unavailable.
+    from pogom.models import Pokemon
+
+    # Refresh every x hours.
+    args = get_args()
+    hours = args.rarity_hours
+    root_path = args.root_path
+
+    rarities_path = os.path.join(root_path, 'static/dist/data/rarity.json')
+    update_frequency_mins = args.rarity_update_frequency
+    refresh_time_sec = update_frequency_mins * 60
+
+    while True:
+        log.info('Updating dynamic rarity...')
+
+        start = default_timer()
+        db_rarities = Pokemon.get_spawn_counts(hours)
+        total = db_rarities['total']
+        pokemon = db_rarities['pokemon']
+
+        # Store as an easy lookup table for front-end.
+        rarities = {}
+
+        for poke in pokemon:
+            rarities[poke['pokemon_id']] = get_pokemon_rarity(total,
+                                                              poke['count'])
+
+        # Save to file.
+        with open(rarities_path, 'w') as outfile:
+            json.dump(rarities, outfile)
+
+        duration = default_timer() - start
+        log.info('Updated dynamic rarity. It took %.2fs for %d entries.',
+                 duration,
+                 total)
+
+        # Wait x seconds before next refresh.
+        log.debug('Waiting %d minutes before next dynamic rarity update.',
+                  refresh_time_sec / 60)
+        time.sleep(refresh_time_sec)
+
+
+# Translate peewee model class attribute to database column name.
+def peewee_attr_to_col(cls, field):
+    field_column = getattr(cls, field)
+
+    # Only try to do it on populated fields.
+    if field_column is not None:
+        field_column = field_column.db_column
+    else:
+        field_column = field
+
+    return field_column
